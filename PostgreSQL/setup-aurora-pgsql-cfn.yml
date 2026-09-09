@@ -1,0 +1,1050 @@
+---
+## Template for creating an Aurora PostgreSQL workload simulation environment
+## **WARNING** This template creates an Amazon EC2 instance and an Aurora PostgreSQL cluster (one writer, one reader).
+## You will be billed for the AWS resources used if you create a stack from this template.
+##
+##
+## Dependencies:
+## none
+##This is a sample file and not intended for Production usage
+##
+## Production Note:
+## This template is only meant to demonstrate the workload simulation
+## scenarios described in this repository. It is not meant for production
+## deployment. Before you deploy a stack based on this template in
+## production, we recommend following certain best practices, including:
+## 1. Enable deletion protection on the database, and switch the deletion
+##    policy on the database and KMS keys away from Delete. This template
+##    does not set DeletionProtection on AuroraPgDBCluster, and sets
+##    DeletionPolicy: Delete on AuroraPgDBCluster, AuroraPgFirstInstance,
+##    AuroraPgSecondInstance, AuroraKMSCMK, SecretsMgrKMSCMK, and EbsKMSCMK
+##    (rather than CloudFormation's usual Snapshot default for Aurora) so
+##    that deleting the stack tears everything down in one step with no
+##    leftover snapshot to clean up separately. For a production database,
+##    set DeletionProtection: true on AuroraPgDBCluster, and change
+##    DeletionPolicy from Delete to Retain or Snapshot on AuroraPgDBCluster,
+##    AuroraKMSCMK, SecretsMgrKMSCMK, and EbsKMSCMK -- leaving the KMS keys
+##    on Delete means a stack deletion schedules the encryption key for
+##    deletion too, which can make any surviving snapshots/backups (or, for
+##    EbsKMSCMK, any retained bastion EBS volume/AMI) permanently unreadable.
+##
+## Scope and limitations:
+## This template is a minimal setup for reproducing and studying lock
+## contention behavior; it is not a hardened reference architecture.
+## Before adapting it for production, consider adding/reviewing:
+## - Secrets Manager rotation (disabled here for simplicity)
+## - Amazon RDS/Amazon Aurora IAM database authentication (not enabled)
+## - Bastion host hardening (patching, session logging). The bastion has
+##   no SSH access at all -- no EC2 key pair is created/attached, and the
+##   security group has no inbound rules -- so AWS Systems Manager Session
+##   Manager (already configured via AmazonSSMManagedInstanceCore + the
+##   SSM Agent) is the only way to reach it.
+## - Narrower KMS key administrator permissions than the root-account
+##   statement used here
+## - Multi-region/DR, WAF, and centralized logging, none of which are
+##   in scope for this workload simulation sample
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Stack with an Aurora PostgreSQL cluster (one writer and one reader) and an EC2 instance pre-configured to connect to it for running the workload simulation scripts in this repo
+
+
+Metadata:
+  LICENSE: Apache License Version 2.0
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: Bastion host configuration
+      Parameters:
+      - BastionInstanceClass
+    - Label:
+        default: Database Configuration
+      Parameters:
+      - PgSQLDBEngineVersion
+      - DBInstanceClass
+      - DBStorageType
+
+    - Label:
+        default: Advanced Settings - Network Configuration
+      Parameters:
+      - vpcCidr
+      - subPub1Cidr
+      - subPub2Cidr
+      - subPrv1Cidr
+      - subPrv2Cidr
+      - subPrv3Cidr
+
+    - Label:
+        default: Static Settings - Bastion Host AMI
+      Parameters:
+      - BastionHostAmiId
+
+    ParameterLabels:
+      BastionInstanceClass:
+        default: Instance Class for Bastion Host
+      DBInstanceClass:
+        default: DB Instance Class
+      PgSQLDBEngineVersion:
+        default: Database Engine Version
+      DBStorageType:
+        default: Database storage type (standard or aurora-iopt1)
+      vpcCidr:
+        default: VPC CIDR Block
+      subPub1Cidr: 
+        default: Public Subnet 1 CIDR Block
+      subPub2Cidr: 
+        default: Public Subnet 2 CIDR Block
+      subPrv1Cidr:
+        default: Private Subnet 1 CIDR Block
+      subPrv2Cidr:
+        default: Private Subnet 2 CIDR Block
+      subPrv3Cidr:
+        default: Private Subnet 3 CIDR Block
+      BastionHostAmiId:
+        default: AMI ID for Bastion Host
+
+
+## Parameters
+Parameters:
+
+  BastionInstanceClass:
+    Default: t3.medium
+    Description: Instance Class for Bastion Host.
+    Type: String
+    AllowedValues:
+    - t3.medium
+    - t3.2xlarge
+    - c6in.4xlarge
+    - c6in.xlarge
+    - c5n.4xlarge
+    - c5n.xlarge
+
+  DBInstanceClass:
+    Default: db.r7g.large
+    Description: Database Instance Class
+    Type: String    
+    AllowedValues:
+    - db.r6i.4xlarge
+    - db.r6i.8xlarge
+    - db.r6i.12xlarge
+    - db.r6i.16xlarge
+    - db.r6i.24xlarge
+    - db.r7g.large
+    - db.r7g.4xlarge
+    - db.r7g.8xlarge
+    - db.r7g.12xlarge
+    - db.r7g.16xlarge
+    - db.r6g.4xlarge
+    - db.r6g.8xlarge
+    - db.r6g.12xlarge
+    - db.r6g.16xlarge
+    - db.r6gd.4xlarge
+    - db.r6gd.8xlarge
+    - db.r6gd.12xlarge
+    - db.r6gd.16xlarge
+    - db.r5d.4xlarge
+    - db.r5d.4xlarge
+    - db.r5d.12xlarge
+    - db.r5d.16xlarge
+    - db.r5d.24xlarge
+
+
+  PgSQLDBEngineVersion:
+    Description: Select Database Engine Version
+    Type: String
+    Default: 17
+    AllowedValues:
+      - 16
+      - 17
+      - 18
+
+  DBStorageType:
+    Description: Select database storage type
+    Type: String
+    Default: aurora-iopt1
+    AllowedValues:
+      - aurora-iopt1
+      - standard
+
+
+  vpcCidr: 
+    Description: VPC CIDR Block
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+    Default: 10.1.0.0/16
+    Type: String
+
+  subPub1Cidr:
+    Description: CIDR Block for public subnet in AZ-1
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+    Default: 10.1.0.0/24
+    Type: String
+
+  subPub2Cidr: 
+    Description: CIDR Block for public subnet in AZ-2
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+    Default: 10.1.1.0/24
+    Type: String
+
+  subPrv1Cidr: 
+    Description: CIDR Block for private subnet in AZ-1
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+    Default: 10.1.10.0/24
+    Type: String
+
+  subPrv2Cidr:
+    Description: CIDR Block for private subnet in AZ-2
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+    Default: 10.1.11.0/24
+    Type: String
+
+  subPrv3Cidr:
+    Description: CIDR Block for private subnet in AZ-3
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+    Default: 10.1.12.0/24
+    Type: String
+
+  BastionHostAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Description: AMI from Bastion Host (do no modify)
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+    AllowedValues:
+      - '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+
+
+## Resources
+Resources:
+## Create a new parameter group to be used for Aurora PostgreSQL cluster and instance
+
+  AuroraPgClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: !Sub 
+        - Aurora PostgreSQL DB Cluster Parameter Group for version ${PgMajorVersion} for ${AWS::StackName}
+        - PgMajorVersion: !Select
+           - 0
+           - !Split
+             - '.'
+             - Ref: PgSQLDBEngineVersion
+      Family: !Sub
+        - 'aurora-postgresql${PgMajorVersion}'
+        - PgMajorVersion: !Select
+           - 0
+           - !Split
+             - '.'
+             - Ref: PgSQLDBEngineVersion
+      Parameters:
+        rds.force_autovacuum_logging_level: "info"
+        log_autovacuum_min_duration: 5000
+        track_activity_query_size: 16384
+        shared_preload_libraries: pg_stat_statements
+        # Rejects any client connection that doesn't negotiate TLS/SSL,
+        # rather than relying on libpq's default 'prefer' sslmode (which
+        # silently falls back to plaintext if SSL negotiation fails). The
+        # bastion additionally sets PGSSLMODE=require client-side so this
+        # is enforced from both ends. See README PostgreSQL/README.md
+        # Section 3.8 for the stronger verify-full option.
+        rds.force_ssl: "1"
+
+
+  AuroraPgDBParamGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub 
+        - Aurora PostgreSQL DB Instance Parameter Group for version ${PgMajorVersion} for ${AWS::StackName}
+        - PgMajorVersion: !Select
+           - 0
+           - !Split
+             - '.'
+             - Ref: PgSQLDBEngineVersion
+      Family: !Sub
+        - 'aurora-postgresql${PgMajorVersion}'
+        - PgMajorVersion: !Select
+           - 0
+           - !Split
+             - '.'
+             - Ref: PgSQLDBEngineVersion
+
+
+
+        
+## Create a new KMS Key to be used for encrypting DB and PI
+  AuroraKMSCMK:
+    Type: 'AWS::KMS::Key'
+    DeletionPolicy: Delete
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          # Root account is scoped to key administration/lifecycle actions
+          # only (not data-plane Encrypt/Decrypt/GenerateDataKey, which are
+          # delegated to the RDS service principal below via least privilege).
+          Action:
+          - 'kms:Create*'
+          - 'kms:Describe*'
+          - 'kms:Enable*'
+          - 'kms:List*'
+          - 'kms:Put*'
+          - 'kms:Update*'
+          - 'kms:Revoke*'
+          - 'kms:Disable*'
+          - 'kms:Get*'
+          - 'kms:Delete*'
+          - 'kms:ScheduleKeyDeletion'
+          - 'kms:CancelKeyDeletion'
+          - 'kms:TagResource'
+          - 'kms:UntagResource'
+          Resource: '*'
+        # Grants data-plane use of this CMK via a Forward Access Session
+        # (FAS): RDS calls KMS using the permissions of whichever IAM
+        # principal in this account is setting up encryption for the
+        # cluster (e.g. the CloudFormation execution role). kms:ViaService
+        # only takes effect for FAS requests, which requires an AWS
+        # principal here rather than a Service principal -- a Service
+        # principal caused CREATE_FAILED with "Access to KMS is not
+        # allowed". The account-root principal (rather than a bare '*')
+        # keeps this scoped to identities in this account whose own
+        # IAM policy already authorizes them, consistent with how the
+        # root-account statement above is used for key administration,
+        # and avoids the wildcard-principal pattern AWS's own KMS key
+        # policy security scanners flag.
+        - Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          Action:
+          - 'kms:Encrypt'
+          - 'kms:Decrypt'
+          - 'kms:ReEncrypt*'
+          - 'kms:GenerateDataKey*'
+          - 'kms:CreateGrant'
+          - 'kms:ListGrants'
+          - 'kms:DescribeKey'
+          Resource: '*'
+          Condition:
+            StringEquals:
+              'kms:CallerAccount': !Ref 'AWS::AccountId'
+              'kms:ViaService': !Sub 'rds.${AWS::Region}.amazonaws.com'
+
+## Create a new KMS Key to be used for encrypting Secrets
+  SecretsMgrKMSCMK:
+    Type: 'AWS::KMS::Key'
+    DeletionPolicy: Delete
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          # Root account is scoped to key administration/lifecycle actions
+          # only (not data-plane Encrypt/Decrypt/GenerateDataKey, which are
+          # delegated to the Secrets Manager grant below via least
+          # privilege).
+          Action:
+          - 'kms:Create*'
+          - 'kms:Describe*'
+          - 'kms:Enable*'
+          - 'kms:List*'
+          - 'kms:Put*'
+          - 'kms:Update*'
+          - 'kms:Revoke*'
+          - 'kms:Disable*'
+          - 'kms:Get*'
+          - 'kms:Delete*'
+          - 'kms:ScheduleKeyDeletion'
+          - 'kms:CancelKeyDeletion'
+          - 'kms:TagResource'
+          - 'kms:UntagResource'
+          Resource: '*'
+        # Grants data-plane use of this CMK via a Forward Access Session
+        # (FAS): Secrets Manager calls KMS using the permissions of
+        # whichever IAM principal in this account is creating/reading the
+        # secret (e.g. the CloudFormation execution role, or the bastion's
+        # roleBastionHost via its secretsmanager:GetSecretValue grant).
+        # kms:ViaService only takes effect for FAS requests, which
+        # requires an AWS principal here rather than a Service principal
+        # -- a Service principal caused CREATE_FAILED with "Access to KMS
+        # is not allowed". The account-root principal (rather than a bare
+        # '*') keeps this scoped to identities in this account whose own
+        # IAM policy already authorizes them, and avoids the
+        # wildcard-principal pattern AWS's own KMS key policy security
+        # scanners flag.
+        - Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          Action:
+          - 'kms:Encrypt'
+          - 'kms:Decrypt'
+          - 'kms:ReEncrypt*'
+          - 'kms:GenerateDataKey*'
+          - 'kms:CreateGrant'
+          - 'kms:ListGrants'
+          - 'kms:DescribeKey'
+          Resource: '*'
+          Condition:
+            StringEquals:
+              'kms:CallerAccount': !Ref 'AWS::AccountId'
+              'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+        # Note: no separate Principal: '*' statement is needed for the
+        # bastion host to decrypt this secret. The root-account statement
+        # above delegates permission management to IAM, and
+        # roleBastionHost's own inline policy (bstn-prfl-inline-kms-policy)
+        # already grants it kms:Decrypt/kms:DescribeKey on this key.
+
+## Create a new KMS Key to be used for encrypting the bastion host's EBS root volume
+  EbsKMSCMK:
+    Type: 'AWS::KMS::Key'
+    DeletionPolicy: Delete
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          # Root account is scoped to key administration/lifecycle actions
+          # only (not data-plane Encrypt/Decrypt/GenerateDataKey, which are
+          # delegated to the EC2 grant below via least privilege).
+          Action:
+          - 'kms:Create*'
+          - 'kms:Describe*'
+          - 'kms:Enable*'
+          - 'kms:List*'
+          - 'kms:Put*'
+          - 'kms:Update*'
+          - 'kms:Revoke*'
+          - 'kms:Disable*'
+          - 'kms:Get*'
+          - 'kms:Delete*'
+          - 'kms:ScheduleKeyDeletion'
+          - 'kms:CancelKeyDeletion'
+          - 'kms:TagResource'
+          - 'kms:UntagResource'
+          Resource: '*'
+        # Grants data-plane use of this CMK via a Forward Access Session
+        # (FAS): EC2 calls KMS using the permissions of whichever IAM
+        # principal in this account launches the bastion instance (e.g.
+        # the identity running `aws cloudformation deploy`). EC2 does not
+        # use roleBastionHost for this -- when an instance with an
+        # encrypted volume is launched, the KMS grant is issued to a
+        # separate, AWS-managed "identity-only role" scoped to that one
+        # instance, not to the instance's own IAM role. See
+        # https://docs.aws.amazon.com/ebs/latest/userguide/ebs-encryption-requirements.html.
+        # kms:ViaService only takes effect for FAS requests, which
+        # requires an AWS principal here rather than a Service principal
+        # -- a Service principal caused CREATE_FAILED with "Access to KMS
+        # is not allowed" for the other CMKs in this template. The
+        # account-root principal (rather than a bare '*') keeps this
+        # scoped to identities in this account whose own IAM policy
+        # already authorizes them, consistent with the other CMKs above,
+        # and avoids the wildcard-principal pattern AWS's own KMS key
+        # policy security scanners flag.
+        - Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          Action:
+          - 'kms:Decrypt'
+          - 'kms:DescribeKey'
+          - 'kms:CreateGrant'
+          - 'kms:GenerateDataKeyWithoutPlaintext'
+          - 'kms:ReEncrypt*'
+          Resource: '*'
+          Condition:
+            StringEquals:
+              'kms:CallerAccount': !Ref 'AWS::AccountId'
+              'kms:ViaService': !Sub 'ec2.${AWS::Region}.amazonaws.com'
+              
+## The VPC
+  vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      CidrBlock: !Ref vpcCidr
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpc
+## Create an IGW & attach it to the VPC
+  vpcIgw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-igw
+  attachIgwVpc:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref vpc
+      InternetGatewayId: !Ref vpcIgw
+
+## Create a public subnet in each AZ
+  sub1Public:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref vpc
+      CidrBlock: !Ref subPub1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-pub-sub-1
+  sub2Public:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref vpc
+      CidrBlock: !Ref subPub2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-pub-sub-2
+
+## Associate the public subnets with a public route table
+  rtbPublic:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-rtb
+  rteToIgw:
+    Type: AWS::EC2::Route
+    DependsOn: attachIgwVpc
+    Properties:
+      RouteTableId: !Ref rtbPublic
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref vpcIgw
+  srta1Public:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref sub1Public
+      RouteTableId: !Ref rtbPublic
+  srta2Public:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref sub2Public
+      RouteTableId: !Ref rtbPublic
+
+## Create a private subnet in each AZ
+  sub1Private:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref vpc
+      CidrBlock: !Ref subPrv1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-prv-sub-1
+  sub2Private:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref vpc
+      CidrBlock: !Ref subPrv2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-prv-sub-2
+  sub3Private:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref vpc
+      CidrBlock: !Ref subPrv3Cidr
+      AvailabilityZone: !Select [2, !GetAZs ]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-prv-sub-3
+
+## Create a NAT Gateway & EIP
+  natEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  vpcNgw:
+    Type: AWS::EC2::NatGateway
+    DependsOn: attachIgwVpc
+    Properties:
+      AllocationId: !GetAtt natEip.AllocationId
+      SubnetId: !Ref sub2Public
+
+## Associate the private subnets with a NAT route table
+  rtbNat:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-nat-rtb
+  rteToNgw:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref rtbNat
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref vpcNgw
+  srta1Ngw:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref sub1Private
+      RouteTableId: !Ref rtbNat
+  srta2Ngw:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref sub2Private
+      RouteTableId: !Ref rtbNat
+  srta3Ngw:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref sub3Private
+      RouteTableId: !Ref rtbNat
+
+## Create DB subnet group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub ${AWS::StackName}-db-subnet-group
+      SubnetIds: [ !Ref sub1Private, !Ref sub2Private, !Ref sub3Private ]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-db-subnet-group
+
+## Create bastion host security group
+  bastionSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref vpc
+      GroupName: !Sub ${AWS::StackName}-bastion-host
+      GroupDescription: Security Group to be used for bastion host instance in the workload simulation setup
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-bastion-host
+      # No SecurityGroupIngress rules: this bastion has no SSH access (no
+      # EC2 key pair is created/attached to the instance either -- see
+      # bastionHost below). The only way to reach it is AWS Systems
+      # Manager Session Manager, which is outbound-initiated over the
+      # HTTPS egress rule below and needs no inbound rule at all.
+      # Egress is scoped to what the bastion's UserData script and normal
+      # operation actually need, instead of allow-all:
+      # - 443/tcp: HTTPS for git clone (both sources cloned over https://),
+      #   yum/dnf package installs, pip, and AWS API calls (Secrets
+      #   Manager, RDS, SSM). Port 5432 to the DB is granted separately
+      #   below via a standalone SecurityGroupEgress resource (avoids a
+      #   circular dependency with dbSecGroup's ingress rule, which also
+      #   references this group).
+      # - 53/tcp+udp: DNS resolution for the hostnames above.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for package installs (yum/dnf/pip), source builds (git over https), and AWS API calls
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: DNS resolution (TCP fallback for large responses)
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: DNS resolution
+
+## Create DB instance security group
+  dbSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref vpc
+      GroupName: !Sub ${AWS::StackName}-workload-sim-internal
+      GroupDescription: Security Group to be used for the Amazon Aurora cluster in the workload simulation setup
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-workload-sim-internal
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref bastionSecGroup
+          Description: Allows DB access from bastion host
+      # Egress is scoped to loopback only (rather than left unset, which
+      # CloudFormation would default to allow-all). The Aurora cluster
+      # itself does not need any outbound network access: calls the DB
+      # engine appears to make to Secrets Manager/CloudWatch Logs (for
+      # password rotation checks, log export, enhanced monitoring, etc.)
+      # are made by the RDS/Aurora control plane on the service's behalf,
+      # outside of this security group's network path, not from inside
+      # the DB instance itself.
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 127.0.0.1/32
+          Description: No outbound access is required by the Amazon Aurora cluster; explicit deny-all placeholder so the default allow-all egress rule is not created
+
+# Separate egress rule (rather than inline on bastionSecGroup) referencing
+# dbSecGroup by ID. Declaring this inline on bastionSecGroup instead would
+# create a circular dependency, since dbSecGroup's own ingress rule already
+# references bastionSecGroup.
+  bastionToDbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref bastionSecGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref dbSecGroup
+      Description: Allows the bastion host to reach the Aurora cluster on the PostgreSQL port
+
+## Create enhanced monitoring role
+  roleEnhancedMonitoring:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-monitor-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - monitoring.rds.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+## Create role for bastion host
+  roleBastionHost:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-bastion-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'sts:AssumeRole'
+            Principal:
+              Service:
+                - 'ec2.amazonaws.com'
+                - 'ssm.amazonaws.com'
+      ManagedPolicyArns:
+        # AmazonSSMManagedInstanceCore grants the permissions the SSM Agent
+        # needs for Session Manager connectivity; there is no need for the
+        # broader (and deprecated) AmazonEC2RoleforSSM managed policy, nor a
+        # separate ssm:* inline statement, since this host doesn't call the
+        # SSM API directly.
+        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-bstn-prfl-inline-rds-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBParameterGroups
+                  - rds:DescribeDBParameters
+                  - rds:DownloadDBLogFilePortion
+                  - rds:RebootDBInstance
+                  - rds:DescribeDBClusters
+                  - rds:DescribeDBClusterParameters
+                  - rds:DescribeDBClusterParameterGroups
+                Resource: 
+                  - !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:instance:${AuroraPgFirstInstance}"
+                  - !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:instance:${AuroraPgSecondInstance}"
+                  - !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${AuroraPgDBCluster}"
+        - PolicyName: !Sub ${AWS::StackName}-bstn-prfl-inline-kms-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !GetAtt SecretsMgrKMSCMK.Arn
+        - PolicyName: !Sub ${AWS::StackName}-bstn-prfl-inline-secretsmgr-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref PgSQLsecretAdminUser
+  profileBastionHost:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - Ref: roleBastionHost
+
+## Create the bastion host
+  bastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      SubnetId: !Ref sub1Public
+      InstanceType: !Ref BastionInstanceClass
+      SecurityGroupIds: [ !Ref bastionSecGroup ]
+      # No KeyName: this instance has no SSH access. Connect via AWS
+      # Systems Manager Session Manager instead (see BastionHost output).
+      EbsOptimized: true
+      # Root volume is encrypted with a dedicated CMK (EbsKMSCMK) rather
+      # than the account's default aws/ebs key, so access to decrypt it
+      # (e.g. from a snapshot/AMI copy) is governed by this template's
+      # own key policy instead of an account-wide default. /dev/xvda is
+      # the root device name for the al2023-ami-kernel-default-x86_64 AMI
+      # referenced by BastionHostAmiId.
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            Encrypted: true
+            KmsKeyId: !GetAtt EbsKMSCMK.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-workload-sim-bastion-host
+      ImageId: !Ref BastionHostAmiId
+      IamInstanceProfile: !Ref profileBastionHost
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -x
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          sudo yum -y makecache
+          sudo yum -y update
+          sudo dnf install -y git gcc make automake libtool readline-devel libicu-devel zlib-devel openssl-devel ncurses-compat-libs perl openssl jq bison flex pip
+
+          ## Build the PostgreSQL client (psql) and sysbench (with PostgreSQL support) from source.
+          ## Both sources are checked out at an immutable release tag (rather than a
+          ## moving branch like REL_16_STABLE or 1.0) so this script always builds the
+          ## same reproducible version instead of picking up unreviewed upstream changes.
+          git clone https://git.postgresql.org/git/postgresql.git
+          cd postgresql
+          git checkout REL_17_10
+          sudo ./configure --with-ssl=openssl --prefix=/usr/pgsql
+          sudo make world-bin
+          sudo make install-world-bin
+          export PATH=$PATH:/usr/pgsql/bin
+          echo "export LD_LIBRARY_PATH=/usr/pgsql/lib" >> /etc/profile
+          export LD_LIBRARY_PATH=/usr/pgsql/lib
+          cd ..
+          git clone https://github.com/akopytov/sysbench
+          cd sysbench
+          git checkout 1.0.20
+          sudo ./autogen.sh --force
+          sudo ./configure --with-pgsql --with-pgsql-libs="/usr/pgsql/lib" --with-pgsql-includes="/usr/pgsql/include" --without-mysql
+          sudo make
+          sudo make install
+          cd ..
+
+          sudo systemctl enable amazon-ssm-agent
+          sudo systemctl start amazon-ssm-agent
+          pip install --upgrade "pip==24.0"
+          pip install "awscli==1.32.100" --upgrade --user
+
+          ## Fetch DB credentials from Secrets Manager and configure client connection variables.
+          ## `set +x` disables command tracing for the remainder of this script so the
+          ## password is never written to /var/log/user-data.log (the script started
+          ## with `bash -x`, which would otherwise print each command *after* variable
+          ## expansion, including the plaintext password). Tracing is intentionally left
+          ## disabled through every line below that references $ADMINPASS/$PGPASSWORD,
+          ## including the .bash_profile export and the .pgpass write, since this is the
+          ## last logic in the script.
+          set +x
+          SECRET=$(aws secretsmanager get-secret-value --secret-id ${PgSQLsecretAdminUser} --query SecretString  --region ${AWS::Region} --output text)
+          ADMINUSER=$(echo $SECRET | jq -r .username)
+          ADMINPASS=$(echo $SECRET | jq -r .password)
+          export PGPORT=5432
+          export PGDATABASE=postgres
+          export PGUSER=$ADMINUSER
+          export PATH=$PATH:/usr/pgsql/bin
+          export PGHOST=${AuroraPgDBCluster.Endpoint.Address}
+          export PGHOST_RR=${AuroraPgDBCluster.ReadEndpoint.Address}
+          export PGPASSWORD="$ADMINPASS"
+          # Enforced server-side too via rds.force_ssl=1 on the cluster
+          # parameter group; setting it here as well means psql/sysbench
+          # fail fast with a clear TLS error instead of silently trying
+          # plaintext first (libpq's default sslmode is 'prefer').
+          export PGSSLMODE=require
+
+          # ADMINPASS/PGPASSWORD are fetched dynamically from Secrets Manager on
+          # every new shell (rather than persisted as plaintext in this file) so
+          # that a compromise of ~/.bash_profile alone does not disclose the DB
+          # admin password. The $() call is escaped so it runs at login time, not
+          # when this UserData script executes.
+          echo "export PGPORT=5432
+          export PGDATABASE=postgres
+          export PGUSER=$ADMINUSER
+          export PATH=\$PATH:/usr/pgsql/bin
+          export PGHOST=${AuroraPgDBCluster.Endpoint.Address}
+          export PGHOST_RR=${AuroraPgDBCluster.ReadEndpoint.Address}
+          export PGSSLMODE=require
+          export ADMINUSER=$ADMINUSER
+          export ADMINPASS=\$(aws secretsmanager get-secret-value --secret-id ${PgSQLsecretAdminUser} --query SecretString --region ${AWS::Region} --output text | jq -r .password)
+          export PGPASSWORD=\"\$ADMINPASS\"
+          export LD_LIBRARY_PATH=/usr/pgsql/lib
+          " >> /home/ec2-user/.bash_profile
+
+          echo "${AuroraPgDBCluster.ReadEndpoint.Address}:5432:*:$ADMINUSER:$ADMINPASS
+          ${AuroraPgDBCluster.Endpoint.Address}:5432:*:$ADMINUSER:$ADMINPASS
+          " > /home/ec2-user/.pgpass
+          chown ec2-user /home/ec2-user/.pgpass
+          chmod 600 /home/ec2-user/.pgpass
+
+    DependsOn: [ AuroraPgFirstInstance ]
+
+
+## Create a random generated password and store it as a secret
+
+  ## PRODUCTION NOTE: automatic rotation is intentionally left disabled
+  ## below (no RotationRules/RotationLambdaARN) to keep this sample
+  ## simple. For any production or long-lived deployment, enable Secrets
+  ## Manager rotation on this secret -- e.g. via the RDS/Aurora-native
+  ## rotation Lambda -- and rotate on a schedule (AWS recommends at
+  ## minimum every 30 days) so a leaked credential doesn't stay valid
+  ## indefinitely. See PostgreSQL/README.md Section 3.8.
+  PgSQLsecretAdminUser:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub "Admin user credentials for ${AWS::StackName}-pgsql-instance"
+      KmsKeyId: !Ref SecretsMgrKMSCMK
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "adminuser"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 24
+        ExcludePunctuation: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-secret
+
+
+  AuroraPgDBCluster:
+    DeletionPolicy: Delete
+    Type: AWS::RDS::DBCluster
+    Properties:
+      CopyTagsToSnapshot: true
+      Engine: aurora-postgresql
+      AvailabilityZones: 
+        - !Select [0, !GetAZs ]
+        - !Select [1, !GetAZs ]
+        - !Select [2, !GetAZs ]
+      EngineVersion : !Ref PgSQLDBEngineVersion
+      EnableCloudwatchLogsExports: 
+        - postgresql
+      Port: 5432
+      DBClusterIdentifier: !Sub ${AWS::StackName}-aurora-pg-cluster
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      DBClusterParameterGroupName: !Ref AuroraPgClusterParameterGroup
+      StorageType: !Ref DBStorageType
+      BackupRetentionPeriod: 35
+      EnableIAMDatabaseAuthentication: true
+      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref PgSQLsecretAdminUser, ':SecretString:username}}' ]]
+      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref PgSQLsecretAdminUser, ':SecretString:password}}' ]]
+      KmsKeyId: !Ref AuroraKMSCMK
+      StorageEncrypted: true
+      VpcSecurityGroupIds: [ !Ref dbSecGroup ]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-aurora-pg-cluster
+        - Key: architecture
+          Value: aurorapgsql
+    DependsOn: [AuroraPgClusterParameterGroup,AuroraKMSCMK, PgSQLsecretAdminUser]
+
+  AuroraPgFirstInstance:
+    DeletionPolicy: Delete
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs ]      
+      DBInstanceClass:
+        Ref: DBInstanceClass
+      DBClusterIdentifier: !Sub ${AWS::StackName}-aurora-pg-cluster  
+      Engine: aurora-postgresql
+      EngineVersion: !Ref PgSQLDBEngineVersion
+      DBParameterGroupName:
+        Ref: AuroraPgDBParamGroup
+      MonitoringInterval: 1
+      MonitoringRoleArn: !GetAtt roleEnhancedMonitoring.Arn
+      AutoMinorVersionUpgrade: true
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsKMSKeyId: !Ref AuroraKMSCMK
+      PerformanceInsightsRetentionPeriod: 731
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-aurora-pg-instance-1
+        - Key: architecture
+          Value: aurora-pgsql
+        - Key: engine
+          Value: aurora-postgresql
+        - Key: engineVersion
+          Value: !Sub postgresql-${PgSQLDBEngineVersion}
+    DependsOn: [ AuroraPgDBCluster, AuroraPgDBParamGroup ]
+
+  AuroraPgSecondInstance:
+    DeletionPolicy: Delete
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs ]
+      DBInstanceClass:
+        Ref: DBInstanceClass
+      DBClusterIdentifier: !Sub ${AWS::StackName}-aurora-pg-cluster  
+      Engine: aurora-postgresql
+      EngineVersion: !Ref PgSQLDBEngineVersion
+      DBParameterGroupName:
+        Ref: AuroraPgDBParamGroup
+      MonitoringInterval: 1
+      MonitoringRoleArn: !GetAtt roleEnhancedMonitoring.Arn
+      AutoMinorVersionUpgrade: true
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsKMSKeyId: !Ref AuroraKMSCMK
+      PerformanceInsightsRetentionPeriod: 731
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-aurora-pg-instance-2
+        - Key: architecture
+          Value: aurora-pgsql
+        - Key: engine
+          Value: aurora-postgresql
+        - Key: engineVersion
+          Value: !Sub postgresql-${PgSQLDBEngineVersion}
+    DependsOn: [ AuroraPgFirstInstance ]
+
+
+## Outputs
+Outputs:
+  secretArnPgSQL:
+    Description: Database Credentials Secret ARN
+    Value: !Ref PgSQLsecretAdminUser
+
+  ClusterWriterEndpoint:
+    Description: Aurora PostgreSQL cluster writer endpoint (PGHOST)
+    Value: !GetAtt AuroraPgDBCluster.Endpoint.Address
+
+  ClusterReaderEndpoint:
+    Description: Aurora PostgreSQL cluster reader endpoint (PGHOST_RR)
+    Value: !GetAtt AuroraPgDBCluster.ReadEndpoint.Address
+
+  BastionConnectCommand:
+    Description: The AWS CLI command to connect to the bastion host via SSM Session Manager (no SSH access exists). Once connected, run 'sudo su - ec2-user' to switch to the account with PGHOST/PGUSER/PGPASSWORD already configured.
+    Value: !Join ['', ['aws ssm start-session --target ', !Ref bastionHost, ' --region ', !Ref 'AWS::Region']]
+
+  SessionMgrLink:
+    Description: Login to AWS console and then use this link to connect to bastion host using session manager
+    Value: !Join
+           - ''
+           - - 'https://'
+             - !Ref AWS::Region
+             - '.console.aws.amazon.com/systems-manager/session-manager/'
+             - !Ref bastionHost
+             - '?region='
+             - !Ref AWS::Region
+             - '#'
